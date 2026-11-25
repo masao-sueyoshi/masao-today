@@ -197,7 +197,15 @@ function getCfg() {
 }
 function setCfg(c) {
   MEM = c;
-  try { localStorage.setItem(K_URL, c.url); localStorage.setItem(K_KEY, c.key); } catch (e) {}
+  try { localStorage.setItem(K_URL, c.url); localStorage.setItem(K_KEY, c.key); localStorage.removeItem(K_CACHE); } catch (e) {}
+}
+// 前回の中身（開いた瞬間に出すため。このスマホの中にだけ置く）。窓口を変えたら捨てる
+const K_CACHE = 'today.cache';
+function readCache() {
+  try { const c = JSON.parse(localStorage.getItem(K_CACHE) || 'null'); return c && c.s ? c : null; } catch (e) { return null; }
+}
+function saveCache() {
+  try { if (S) localStorage.setItem(K_CACHE, JSON.stringify({ at: Date.now(), s: S })); } catch (e) {}
 }
 // 窓口のURLとして受け付けるもの: https のURL（試験用に、この機械の中の http だけは通す）
 function okApiUrl(u) {
@@ -249,6 +257,12 @@ async function load(firstTime) {
   if (loading) return;
   loading = true;
   $('reload').disabled = true;
+  // 前回の中身があれば、待たずにすぐ出す（その後ろで新しい中身を取りに行く）
+  let fromCache = false;
+  if (!S) {
+    const c = readCache();
+    if (c) { S = c.s; fromCache = true; showMain(); render(); $('upd').textContent += ' ・更新中…'; }
+  }
   try {
     const s = await getState();
     S = s; lastLoad = Date.now();
@@ -257,7 +271,7 @@ async function load(firstTime) {
   } catch (e) {
     if (e instanceof BadKey) showSetup('合言葉が違います');
     else if (!S) showSetup('窓口につながりません（' + (e && e.message || e) + '）');
-    else toast('更新できませんでした');
+    else { if (fromCache) render(); toast('更新できませんでした（前回の中身を表示中）'); }
   } finally {
     loading = false; $('reload').disabled = false;
   }
@@ -446,6 +460,7 @@ function render() {
   const E = T.events || [];
   $('events').innerHTML = E.length ? E.map(e => '<li><span><span class="time">' + esc(e.time || '終日') + '</span>' + esc(e.title) + '</span></li>').join('')
     : '<li class="empty">予定なし</li>';
+  saveCache();
 }
 
 // 応募の中身を全部見せる（フォームの各欄、添付、確認、OKの後に本人がやること）
