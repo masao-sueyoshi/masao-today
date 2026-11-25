@@ -271,7 +271,7 @@ async function load(firstTime) {
   } catch (e) {
     if (e instanceof BadKey) showSetup('合言葉が違います');
     else if (!S) showSetup('窓口につながりません（' + (e && e.message || e) + '）');
-    else { if (fromCache) render(); toast('更新できませんでした（前回の中身を表示中）'); }
+    else { if (fromCache) render(); toast(navigator.onLine === false ? '電波がありません（前回の中身を表示中）' : '更新できませんでした（前回の中身を表示中）'); }
   } finally {
     loading = false; $('reload').disabled = false;
   }
@@ -590,6 +590,12 @@ document.addEventListener('visibilitychange', maybeRefresh);
 window.addEventListener('pageshow', e => { if (e.persisted) maybeRefresh(); });
 
 load(true);
+
+// 電波が無くても開けるように、画面のファイルをこの端末に置いておく（sw.js）。中身は前回の分が出る
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localhost|127\.0\.0\.1)$/.test(location.hostname))) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+window.addEventListener('online', () => { if (S && getCfg()) load(true); });
 </script>
 </body>
 </html>
