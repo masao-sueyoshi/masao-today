@@ -15,7 +15,11 @@
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="icon" href="icon-180.png">
 <link rel="manifest" href="manifest.webmanifest">
-<!-- 外のスクリプトや画像を読ませない。通信は Google の窓口だけ（万一の書き換えで、端末に置いた中身や合言葉が外に出ないように） -->
+<!-- 外のスクリプト、画像、通信の先を、このページと Google（Apps Script）だけに絞る。
+     守れるのは「外の場所から読み込んで動かす」「Google 以外へ通信する」こと。守れないこと：
+     ・Google の Apps Script なら、だれのもの（窓口以外）にも通信できる（窓口のURLはファイルに書かないため、絞れない）
+     ・ページの中に書いたスクリプト（'unsafe-inline'）と、別のページへの移動（リンク、location）は止めない
+     そのため、窓口から来た文字は、画面に出す前に必ず esc() で文字にする（タグとして動かさない）。 -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://script.google.com https://script.googleusercontent.com; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'">
 <!--
   今日ページ（Google の外に置く画面）。中身は Google 側の窓口（apps-script/today-api/）から読む。
@@ -89,6 +93,7 @@
   #setup label { display: block; font-size: 14px; font-weight: 600; margin: 14px 0 4px; }
   #setup .why { margin-top: 6px; }
   .err { color: var(--ng); font-weight: 600; font-size: 15px; margin: 10px 0 0; }
+  .note.stale { border-left: 3px solid var(--ng); }
 </style>
 </head>
 <body>
@@ -161,6 +166,8 @@
 <script>
 'use strict';
 let S = null;
+// fresh: 今出している中身を、この画面を開いてから窓口で取れたか。asOf: 出している中身を窓口から取った時刻（ミリ秒）
+let fresh = false, asOf = 0;
 // 中身を開いた応募（id と印の組）。開くまでOKを押せない。中身が変わると印も変わるので、開き直すまで押せない
 const OPENED = new Set();
 const okey = a => a.id + '|' + (a.hash || '');
@@ -171,6 +178,7 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 // リンクにしてよいのは http と https だけ（javascript: などは出さない）。link の label は esc 済みの文字を渡す
 const safeUrl = u => { const s = String(u == null ? '' : u).trim(); return /^https?:\/\//i.test(s) ? s : ''; };
+const hostOf = u => { try { return safeUrl(u) ? new URL(safeUrl(u)).host : ''; } catch (e) { return ''; } };
 const link = (u, label, style) => safeUrl(u) ? '<a href="' + esc(safeUrl(u)) + '" target="_blank" rel="noopener noreferrer"' + (style ? ' style="' + style + '"' : '') + '>' + label + '</a>' : '';
 // 時刻（時差が無ければ日本時間とみなす）。読めなければ NaN
 function ts(s) {
@@ -184,6 +192,20 @@ function later(t, than) { const a = ts(t); if (isNaN(a)) return false; const b =
 const wd = ['日','月','火','水','木','金','土'];
 function md(d) { if (!d) return ''; const m = String(d).match(/(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/); if (!m) return esc(d);
   const dt = new Date(+m[1], +m[2]-1, +m[3]); return (+m[2]) + '/' + (+m[3]) + '（' + wd[dt.getDay()] + '）' + (m[4] ? ' ' + m[4] + ':' + m[5] : ''); }
+// 日本時間の年月日と時刻（端末の時差の設定に関係なく）
+function jst(ms) {
+  const o = {};
+  new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+    .formatToParts(new Date(ms)).forEach(x => { o[x.type] = x.value; });
+  return { ymd: o.year + '-' + o.month + '-' + o.day, md: (+o.month) + '/' + (+o.day), hm: o.hour + ':' + o.minute };
+}
+const jstToday = () => jst(Date.now()).ymd;
+// 中身を取った時刻の出し方：今日なら HH:MM、ほかの日なら M/D HH:MM（full なら、いつも M/D HH:MM）
+function whenText(ms, full) {
+  if (!ms || isNaN(ms)) return '時刻不明';
+  const j = jst(ms);
+  return (full || j.ymd !== jstToday() ? j.md + ' ' : '') + j.hm;
+}
 let toastTimer = 0;
 function toast(t) { const e = $('toast'); e.textContent = t; e.classList.add('on'); clearTimeout(toastTimer); toastTimer = setTimeout(() => e.classList.remove('on'), 2200); }
 
@@ -206,9 +228,12 @@ const K_CACHE = 'today.cache';
 function readCache() {
   try { const c = JSON.parse(localStorage.getItem(K_CACHE) || 'null'); return c && c.s ? c : null; } catch (e) { return null; }
 }
+// 置くのは、窓口から取れたとき（読んだとき、押した結果が返ってきたとき）だけ。前回の中身を出しただけでは置き直さない
 function saveCache() {
-  try { if (S) localStorage.setItem(K_CACHE, JSON.stringify({ at: Date.now(), s: S })); } catch (e) {}
+  try { if (S) localStorage.setItem(K_CACHE, JSON.stringify({ at: asOf || Date.now(), s: S })); } catch (e) {}
 }
+// 押した結果（窓口が返した actions）を入れて、置き直す
+function gotActions(a) { S.actions = a; saveCache(); }
 // 窓口のURLとして受け付けるもの: https のURL（試験用に、この機械の中の http だけは通す）
 function okApiUrl(u) {
   return /^https:\/\/[^\s]+$/i.test(u) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/[^\s]*$/i.test(u);
@@ -241,7 +266,7 @@ async function getState() {
   return check(await readJson(r));
 }
 // この画面が前提にしている窓口の版（apps-script/today-api/コード.gs の CODE_VERSION と同じにする）
-const API_VERSION = '2026-11-25';
+const API_VERSION = '2026-11-26';
 // 書く。本文は JSON の文字（text/plain）。特別なヘッダーは付けない（余計な確認の通信が起きないように）
 async function post(fn, args) {
   const c = getCfg();
@@ -262,21 +287,23 @@ async function load(firstTime) {
   if (loading) return;
   loading = true;
   $('reload').disabled = true;
-  // 前回の中身があれば、待たずにすぐ出す（その後ろで新しい中身を取りに行く）
-  let fromCache = false;
+  // 前回の中身があれば、待たずにすぐ出す（その後ろで新しい中身を取りに行く）。前回の中身だと、上にはっきり出す
   if (!S) {
     const c = readCache();
-    if (c) { S = c.s; fromCache = true; showMain(); render(); $('upd').textContent += ' ・更新中…'; }
-  }
+    if (c) { S = c.s; fresh = false; asOf = ts(c.s.now) || Number(c.at) || 0; showMain(); render(); }
+  } else if (!fresh) render();
   try {
     const s = await getState();
-    S = s; lastLoad = Date.now();
+    S = s; fresh = true; asOf = ts(s.now) || Date.now(); lastLoad = Date.now();
+    saveCache();
+    loading = false;
     showMain(); render();
     if (!firstTime) toast('更新しました');
   } catch (e) {
+    loading = false;
     if (e instanceof BadKey) showSetup('合言葉が違います');
     else if (!S) showSetup('窓口につながりません（' + (e && e.message || e) + '）');
-    else { if (fromCache) render(); toast(navigator.onLine === false ? '電波がありません（前回の中身を表示中）' : '更新できませんでした（前回の中身を表示中）'); }
+    else { fresh = false; render(); toast(navigator.onLine === false ? '電波がありません（前回の中身を表示中）' : '更新できませんでした（前回の中身を表示中）'); }
   } finally {
     loading = false; $('reload').disabled = false;
   }
@@ -316,6 +343,19 @@ function stepDone(key) {
   return !gen || later(t.at, gen);
 }
 
+// 送る仕組み（応募の送信）が動いているか。朝の係が today に sender_active を書く。無い（古い形）ときは、送るとは言わない
+// 言い方は scripts/apply.py の approval_label と同じにする
+const sendOn = () => !!(S && S.today && S.today.sender_active === true);
+const SEND_OFF = 'OK済み。ただ、送る仕組みがまだ止まっているので、自動ではまだ送りません';
+const okText = () => sendOn() ? 'OK（送る）' : 'OK';
+
+// 出せたか確かめる作業（check）の答え。actions のうち、この today を作った後に押したもの（新しい方）
+function stepAnswer(acts) {
+  const done = acts.filter(a => stepDone(a.key));
+  done.sort((a, b) => ts(S.actions.todo[b.key].at) - ts(S.actions.todo[a.key].at));
+  return done[0] || null;
+}
+
 function todoState(id) {
   const t = S.actions.todo && S.actions.todo[id];
   if (!t) return '';
@@ -327,10 +367,19 @@ function render() {
   const T = S.today || {};
   S.actions = S.actions || { approvals: {}, todo: {}, notes: {} };
   $('day').textContent = T.date ? md(T.date) : '今日';
-  $('upd').textContent = T.generated_at ? 'Claude ' + String(T.generated_at).slice(11, 16) + ' 更新' : '';
-  const oldApi = S.api_version !== API_VERSION
-    ? '<div class="note">Google側の「今日ページの窓口」のコードが古い版です（' + esc(S.api_version || '版なし') + '）。Claude に「窓口が古い版」と伝えてください。</div>' : '';
-  $('note').innerHTML = oldApi + (T.note ? '<div class="note">' + esc(T.note) + '</div>' : '');
+  // 上の小さい字：Claude が作った時刻と、窓口から取った時刻（いつの中身か）
+  $('upd').textContent = (T.generated_at ? 'Claude ' + String(T.generated_at).slice(11, 16) + ' 作成 ・ ' : '') + (asOf ? whenText(asOf) + ' 時点' : '');
+  // 前回の中身を出している間は、ずっと出しておく（消えるお知らせだけにしない）
+  const stale = fresh ? '' : '<div class="note stale">前回の中身（' + esc(whenText(asOf, true)) + '時点）・' + (loading ? '更新中…' : '更新できていません') + '</div>';
+  // today が今日（日本時間）の分でなければ（朝の係が止まった、まだ朝の分が来ていない）
+  const oldDay = T.date && T.date !== jstToday() ? '<div class="note stale">今日の分がまだ届いていません（' + md(T.date) + 'の中身）</div>' : '';
+  // 版：どちらが古いかで言い方を変える（日付の形 YYYY-MM-DD なので、文字で比べられる）。前回の中身では出さない
+  const av = String(S.api_version || '');
+  const oldVer = !fresh || av === API_VERSION ? ''
+    : !av || av < API_VERSION
+      ? '<div class="note">Google側の「今日ページの窓口」のコードが古い版です（窓口 ' + esc(av || '版なし') + '、この画面 ' + API_VERSION + '）。Claude に「窓口が古い版」と伝えてください。</div>'
+      : '<div class="note">この画面が古い版です（この画面 ' + API_VERSION + '、窓口 ' + esc(av) + '）。電波のある所で閉じて開き直してください。直らなければ Claude に「今日ページの画面が古い」と伝えてください。</div>';
+  $('note').innerHTML = stale + oldDay + oldVer + (T.note ? '<div class="note">' + esc(T.note) + '</div>' : '');
 
   // 今やる（終わったら次が出る）
   const seen = {}, all = [];
@@ -372,6 +421,8 @@ function render() {
     return '<div class="card ap"><div class="head"><div class="num">' + esc(a.n) + '</div><div style="flex:1;min-width:0">' +
       '<div style="font-weight:700">' + esc(a.org || '') + (a.short ? '<span class="short">短期' + (a.days ? esc(a.days) + '日' : '') + '</span>' : '') + '</div>' +
       '<div>' + esc(a.title || '') + '</div>' +
+      (a.label ? '<div class="tags"><span class="lbl">' + esc(a.label) + '</span></div>' : '') +
+      (a.note ? '<div class="why">' + esc(a.note) + '</div>' : '') +
       '<div class="tags">' + (a.deadline ? '締切 <b>' + md(a.deadline) + '</b>　' : '') + (a.dates ? '日程 ' + esc(a.dates) : '') + '</div>' +
       (a.warnings && a.warnings.length ? '<div class="why">注意: ' + esc(a.warnings.join(' / ')) + '</div>' : '') +
       '</div></div>' +
@@ -382,12 +433,17 @@ function render() {
         '<textarea data-note="' + esc(a.id) + '">' + esc(note) + '</textarea>' +
         '<div class="row"><button class="small" data-savenote="' + esc(a.id) + '">メモを保存</button></div>' +
       '</details>' +
-      '<div class="row"><button class="ok" data-dec="ok" data-id="' + esc(a.id) + '"' + (opened ? '>OK（送る）' : ' disabled>中身を見てからOK') + '</button>' +
+      '<div class="row"><button class="ok" data-dec="ok" data-id="' + esc(a.id) + '"' + (opened ? '>' + okText() : ' disabled>中身を見てからOK') + '</button>' +
       '<button class="ng" data-dec="ng" data-id="' + esc(a.id) + '">やめる</button></div></div>';
   }).join('');
-  const DLABEL = { ok: 'OK・次の送信で送ります', ng: 'やめる', queued: 'OK済み・次の送信で送ります' };
+  // 送る仕組みが止まっている間は「送ります」と言わない
+  const DLABEL = sendOn() ? { ok: 'OK・次の送信で送ります', ng: 'やめる', queued: 'OK済み・次の送信で送ります' }
+    : { ok: SEND_OFF, ng: 'やめる', queued: SEND_OFF };
+  // OK済み（queued）の言い方は、窓口（応募の表）が label で送ってきたらそれを出す。ここで決めたものは、ここの言い方
+  const dlabel = a => (apState(a) === 'queued' && a.label ? a.label : DLABEL[apState(a)] || '');
   $('decided').innerHTML = decided.length ? '<div class="card"><ul class="plain">' + decided.map(a =>
-    '<li><span class="done">' + esc(a.n) + '. ' + esc(a.org || '') + ' ' + esc(a.title || '') + '<br><small>' + DLABEL[apState(a)] + '</small></span>' +
+    '<li><span class="done">' + esc(a.n) + '. ' + esc(a.org || '') + ' ' + esc(a.title || '') + '<br><small>' + esc(dlabel(a)) + '</small>' +
+      (a.note ? '<br><small class="why">' + esc(a.note) + '</small>' : '') + '</span>' +
       '<button class="small" data-dec="cancel" data-id="' + esc(a.id) + '">取り消し</button></li>').join('') + '</ul></div>' : '';
 
   // 聞きたいこと（応募ごとの質問。答えは notes の q:<応募id>:<質問id> に保存し、Claudeが次の回で応募に入れる）
@@ -456,18 +512,25 @@ function render() {
 
   // 残っている作業（応募ごとの、本人がやること）
   // key のあるものに「済」。済にしたものは隠す（次の回でClaudeが応募に記録する）
+  // 出せたか確かめる作業（check）は、actions の数だけボタン（「出せていた」「出せていなかった」）を出す。押したら答えと「戻す」を出す
   const P = (T.open_steps || []).filter(x => x && !(x.key && stepDone(x.key)));
+  const acts = x => (Array.isArray(x.actions) ? x.actions : []).filter(a => a && typeof a.key === 'string' && a.key);
   $('stepWrap').hidden = !P.length;
   const G = []; P.forEach(x => { const g = G.find(y => y.id === x.id); if (g) g.items.push(x); else G.push({ id: x.id, org: x.org, items: [x] }); });
-  $('steps').innerHTML = G.map(g => '<li style="display:block"><b>' + esc(g.org) + '</b>' + g.items.map(x =>
-    '<div class="step"><span class="why">・' + esc(x.step) + (x.deadline ? '（' + md(x.deadline) + 'まで）' : '') + '</span>' +
-    (x.key ? '<button class="small" data-todo="' + esc(x.key) + '" data-st="done">済</button>' : '') + '</div>').join('') + '</li>').join('');
+  $('steps').innerHTML = G.map(g => '<li style="display:block"><b>' + esc(g.org) + '</b>' + g.items.map(x => {
+    const A = x.key ? [] : acts(x), ans = A.length ? stepAnswer(A) : null;
+    const btn = x.key ? '<button class="small" data-todo="' + esc(x.key) + '" data-st="done">済</button>'
+      : ans ? '<button class="small" data-todo="' + esc(ans.key) + '" data-st="undo">戻す</button>'
+      : A.length ? '<span style="flex:0 0 auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">' +
+          A.map(a => '<button class="small" data-todo="' + esc(a.key) + '" data-st="done">' + esc(a.label || '') + '</button>').join('') + '</span>' : '';
+    return '<div class="step"><span class="why' + (ans ? ' done' : '') + '">・' + (x.label ? '<span class="lbl">' + esc(x.label) + '</span>' : '') + esc(x.step || '') + (x.deadline ? '（' + md(x.deadline) + 'まで）' : '') +
+      (x.note ? '<br><small>' + esc(x.note) + '</small>' : '') + (ans ? '<br><small>' + esc(ans.label || '') + 'と答えた（次の回でClaudeが記録する）</small>' : '') + '</span>' + btn + '</div>';
+  }).join('') + '</li>').join('');
 
   // 予定
   const E = T.events || [];
   $('events').innerHTML = E.length ? E.map(e => '<li><span><span class="time">' + esc(e.time || '終日') + '</span>' + esc(e.title) + '</span></li>').join('')
     : '<li class="empty">予定なし</li>';
-  saveCache();
 }
 
 // 応募の中身を全部見せる（フォームの各欄、添付、確認、OKの後に本人がやること）
@@ -493,6 +556,9 @@ function detail(a) {
   const ST = a.steps || [];
   if (ST.length) h += '<div class="fl">OKの後に自分でやること</div><ul class="plain">' + ST.map(x => '<li><span>' + esc(x) + '</span></li>').join('') + '</ul>';
   if (a.deadline_text) h += '<div class="fl">締切</div><div>' + esc(a.deadline_text) + '</div>';
+  // 送り先（OKの後に実際に送る場所）が募集ページと違えば、その場所（ドメイン）を出す
+  const to = hostOf(a.apply_url);
+  if (to && safeUrl(a.apply_url) !== safeUrl(a.url)) h += '<div class="fl">送り先</div><div>' + esc(to) + '</div>';
   return h;
 }
 
@@ -523,7 +589,7 @@ document.addEventListener('click', ev => {
   }
   if (b.dataset.todo) {
     b.disabled = true;
-    call('markTodo', b.dataset.todo, b.dataset.st).then(a => { S.actions = a; render(); toast(b.dataset.st === 'done' ? '終わり' : b.dataset.st === 'later' ? 'あとで' : '戻しました'); }, () => { b.disabled = false; });
+    call('markTodo', b.dataset.todo, b.dataset.st).then(a => { gotActions(a); render(); toast(b.dataset.st === 'later' ? 'あとで' : b.dataset.st !== 'done' ? '戻しました' : /^(not)?sent:/.test(b.dataset.todo) ? '記録しました' : '終わり'); }, () => { b.disabled = false; });
   } else if (b.dataset.dec) {
     const a = ((S.today || {}).approvals || []).find(x => x.id === b.dataset.id);
     b.disabled = true;
@@ -536,13 +602,13 @@ document.addEventListener('click', ev => {
     const id = b.dataset.savenote;
     const t = document.querySelector('textarea[data-note="' + CSS.escape(id) + '"]').value;
     b.disabled = true;
-    call('saveNote', id, t).then(a => { S.actions = a; delete DRAFTS['n:' + id]; b.disabled = false; toast('メモを保存'); }, () => { b.disabled = false; });
+    call('saveNote', id, t).then(a => { gotActions(a); delete DRAFTS['n:' + id]; b.disabled = false; toast('メモを保存'); }, () => { b.disabled = false; });
   } else if (b.dataset.saveqa) {
     const key = b.dataset.saveqa;
     const t = document.querySelector('textarea[data-qa="' + CSS.escape(key) + '"]').value;
     b.disabled = true;
     call('saveNote', key, t).then(a => {
-      S.actions = a; delete DRAFTS[key]; b.disabled = false;
+      gotActions(a); delete DRAFTS[key]; b.disabled = false;
       const saved = !!(a.notes && a.notes[key]);
       const st = document.querySelector('[data-qst="' + CSS.escape(key) + '"]');
       if (st) st.textContent = saved ? QSAVED : '';
@@ -556,14 +622,14 @@ function showSetupMsg(t) { $('setupMsg').hidden = false; $('setupMsg').textConte
 // 記録されなかったら（ページが古いなど）、成功とは言わない
 function decideShown(ids, decision, hashes) {
   call('decide', ids, decision, 'page', hashes).then(act => {
-    S.actions = act;
+    gotActions(act);
     const miss = ids.filter((id, i) => {
       const x = act.approvals && act.approvals[id];
       return !x || x.decision !== decision || (hashes[i] && x.hash !== hashes[i]);
     });
     render();
     if (miss.length) toast('記録できませんでした。「更新」を押してからもう一度');
-    else if (decision === 'ok') toast((ids.length > 1 ? ids.length + '件 ' : '') + 'OK。次の送信で送ります');
+    else if (decision === 'ok') toast((ids.length > 1 ? ids.length + '件 ' : '') + (sendOn() ? 'OK。次の送信で送ります' : 'OK。送る仕組みがまだ止まっているので、自動ではまだ送りません'));
     else toast(decision === 'ng' ? 'やめました' : '取り消しました');
   }, () => { if (S) render(); });
 }
@@ -576,7 +642,7 @@ document.addEventListener('toggle', e => {
   if (!a || OPENED.has(okey(a))) return;
   OPENED.add(okey(a));
   const b = document.querySelector('button[data-dec="ok"][data-id="' + CSS.escape(a.id) + '"]');
-  if (b) { b.disabled = false; b.textContent = 'OK（送る）'; }
+  if (b) { b.disabled = false; b.textContent = okText(); }
   drawBulk();
 }, true);
 
